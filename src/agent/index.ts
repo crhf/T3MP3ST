@@ -23,6 +23,13 @@ import type {
   Task,
 } from '../types/index.js';
 import { reflectStrategy, type StrategicReflection } from '../llm/tool-call-boundary.js';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
+
+/**
+ * Tracer for the ReAct agent. Resolves to the global provider when telemetry is
+ * enabled (src/otel.ts), or a no-op tracer otherwise.
+ */
+const agentTracer = trace.getTracer('t3mp3st.agent');
 
 // =============================================================================
 // TYPES
@@ -146,9 +153,45 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
   }
 
   /**
-   * Run the ReAct loop for a task
+   * Run the ReAct loop for a task.
+   *
+   * Opens the parent `agent.run` span so the gen_ai.chat spans and the
+   * execute_tool spans created during the loop nest under one run in the trace
+   * (chat and tool calls become siblings beneath it via OTEL active-context).
+   * No-op overhead when telemetry is disabled.
    */
   async run(
+    task: Task,
+    systemPrompt: string,
+    target?: Target,
+    sourceContext?: string,
+    sharedContext?: string
+  ): Promise<AgentResult> {
+    return agentTracer.startActiveSpan(
+      'agent.run',
+      { attributes: { 't3mp3st.task.name': task.name } },
+      async (span) => {
+        try {
+          const result = await this.runImpl(task, systemPrompt, target, sourceContext, sharedContext);
+          span.setAttributes({
+            't3mp3st.agent.iterations': result.iterations,
+            't3mp3st.agent.findings': result.findings.length,
+            't3mp3st.agent.tokens': result.tokensUsed,
+            't3mp3st.agent.hit_limit': result.hitLimit,
+          });
+          return result;
+        } catch (err) {
+          span.recordException(err as Error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+          throw err;
+        } finally {
+          span.end();
+        }
+      }
+    );
+  }
+
+  private async runImpl(
     task: Task,
     systemPrompt: string,
     target?: Target,
@@ -450,6 +493,29 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     iteration: number
   ): Promise<AgentStep> {
     const source = iteration < 0 ? 'backend_seeded' : 'agent';
+    // One execute_tool span per tool invocation. Parallel tool calls (the
+    // Promise.all fan-out in the loop) each get their own span because this is
+    // an async function and startActiveSpan scopes to its callback's context.
+    return agentTracer.startActiveSpan(
+      'execute_tool',
+      {
+        attributes: {
+          'gen_ai.operation.name': 'execute_tool',
+          'gen_ai.tool.name': toolCall.name,
+          't3mp3st.tool.source': source,
+        },
+      },
+      (span) => this.executeToolImpl(toolCall, target, iteration, source, span)
+    );
+  }
+
+  private async executeToolImpl(
+    toolCall: LLMToolCall,
+    target: Target | undefined,
+    iteration: number,
+    source: 'agent' | 'backend_seeded',
+    span: import('@opentelemetry/api').Span
+  ): Promise<AgentStep> {
     this.emit('agent:tool_call', { name: toolCall.name, args: toolCall.arguments, source });
 
     let toolResult: ToolResult;
@@ -492,6 +558,18 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     }
 
     this.emit('agent:tool_result', { name: toolCall.name, result: toolResult, source });
+
+    // Record outcome on the span. Tool failures are returned as structured
+    // feedback (not thrown), so mark the span's status from toolResult.success
+    // and surface the failure category when present.
+    span.setAttribute('t3mp3st.tool.success', toolResult.success);
+    if (!toolResult.success) {
+      let category = 'error';
+      try { category = JSON.parse(toolResult.error ?? '{}').category ?? 'error'; } catch { /* non-JSON error */ }
+      span.setAttribute('t3mp3st.tool.error_category', category);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: category });
+    }
+    span.end();
 
     return {
       iteration,
