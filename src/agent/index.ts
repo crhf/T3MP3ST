@@ -8,6 +8,7 @@
 
 import { EventEmitter } from 'eventemitter3';
 import type { LLMBackbone } from '../llm/index.js';
+import { otelCaptureContent, otelClip } from '../llm/index.js';
 import type { Arsenal } from '../arsenal/index.js';
 import {
   ToolError,
@@ -517,6 +518,9 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     span: import('@opentelemetry/api').Span
   ): Promise<AgentStep> {
     this.emit('agent:tool_call', { name: toolCall.name, args: toolCall.arguments, source });
+    if (otelCaptureContent) {
+      span.setAttribute('t3mp3st.tool.arguments', otelClip(JSON.stringify(toolCall.arguments ?? {})));
+    }
 
     let toolResult: ToolResult;
     try {
@@ -563,6 +567,9 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     // feedback (not thrown), so mark the span's status from toolResult.success
     // and surface the failure category when present.
     span.setAttribute('t3mp3st.tool.success', toolResult.success);
+    if (otelCaptureContent) {
+      span.setAttribute('t3mp3st.tool.result', otelClip(JSON.stringify(toolResult)));
+    }
     if (!toolResult.success) {
       let category = 'error';
       try { category = JSON.parse(toolResult.error ?? '{}').category ?? 'error'; } catch { /* non-JSON error */ }

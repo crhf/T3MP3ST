@@ -32,6 +32,19 @@ import { trace, SpanStatusCode } from '@opentelemetry/api';
  */
 const llmTracer = trace.getTracer('t3mp3st.llm');
 
+/**
+ * Span content capture. Prompts/responses/tool I/O can carry sensitive target
+ * data, so capture is a flag: on by default, disable with
+ * T3MP3ST_OTEL_CAPTURE_CONTENT=0. Each value is clipped to
+ * T3MP3ST_OTEL_CONTENT_MAX chars (default 8192) so a span can't balloon. Route
+ * values through src/redact.ts first if you need scrubbing.
+ */
+export const otelCaptureContent = process.env.T3MP3ST_OTEL_CAPTURE_CONTENT !== '0';
+const OTEL_CONTENT_MAX = Number(process.env.T3MP3ST_OTEL_CONTENT_MAX ?? 8192);
+export function otelClip(s: string): string {
+  return s.length > OTEL_CONTENT_MAX ? `${s.slice(0, OTEL_CONTENT_MAX)}…[+${s.length - OTEL_CONTENT_MAX} chars]` : s;
+}
+
 // =============================================================================
 // LLM EVENTS
 // =============================================================================
@@ -1778,6 +1791,15 @@ constructor(config: LLMConfig) {
             'gen_ai.usage.output_tokens': response.usage?.completionTokens ?? 0,
             'gen_ai.usage.total_tokens': response.usage?.totalTokens ?? 0,
           });
+          if (otelCaptureContent) {
+            // Prompt in, completion out — as span events (GenAI convention keeps
+            // message content off the attribute set).
+            span.addEvent('gen_ai.prompt', { content: otelClip(JSON.stringify(messages)) });
+            span.addEvent('gen_ai.completion', { content: otelClip(response.content ?? '') });
+            if (response.toolCalls?.length) {
+              span.setAttribute('gen_ai.response.tool_calls', otelClip(JSON.stringify(response.toolCalls)));
+            }
+          }
           return response;
         } catch (err) {
           span.recordException(err as Error);
