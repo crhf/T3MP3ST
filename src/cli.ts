@@ -5,6 +5,10 @@
  * Command-line interface for T3MP3ST operations.
  */
 
+// Must be first: starts the OpenTelemetry SDK (when enabled) before any
+// module that creates an LLMBackbone is imported below. No-op when disabled.
+import './otel.js';
+
 import { Command } from 'commander';
 import inquirer from 'inquirer';
 import chalk from 'chalk';

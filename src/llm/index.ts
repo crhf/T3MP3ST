@@ -23,6 +23,14 @@ import { config } from '../config/index.js';
 import { localAgentChat } from '../agent/local-agents.js';
 import { fetchBypassingProxy } from '../net/proxy.js';
 import { enforceToolCallBoundary } from './tool-call-boundary.js';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
+
+/**
+ * Tracer for LLM-backbone spans. Resolves to the global provider registered by
+ * src/otel.ts when telemetry is enabled, or a no-op tracer otherwise — so
+ * importing @opentelemetry/api here costs nothing on a normal run.
+ */
+const llmTracer = trace.getTracer('t3mp3st.llm');
 
 // =============================================================================
 // LLM EVENTS
@@ -1738,9 +1746,51 @@ constructor(config: LLMConfig) {
   }
 
   /**
-   * Send a chat message and get a response
+   * Send a chat message and get a response.
+   *
+   * Thin OpenTelemetry wrapper around {@link chatImpl}: it opens ONE
+   * `gen_ai.chat` span per logical call and awaits the real implementation
+   * inside the span's active context, so concurrent calls on the same backbone
+   * (e.g. the orchestrator's Promise.all worker fan-out) each get a correctly
+   * scoped span and nest under whatever called them. The retry/fallback ladder
+   * stays a single span — its hops are internal, not separate spans. When
+   * telemetry is disabled the tracer is the OTEL no-op, so this is ~free.
    */
   async chat(
+    messages: LLMMessage[],
+    options?: ChatOptions
+  ): Promise<LLMResponse> {
+    return llmTracer.startActiveSpan(
+      'gen_ai.chat',
+      {
+        attributes: {
+          'gen_ai.operation.name': 'chat',
+          'gen_ai.system': this.config.provider,
+          'gen_ai.request.model': this.config.model,
+        },
+      },
+      async (span) => {
+        try {
+          const response = await this.chatImpl(messages, options);
+          span.setAttributes({
+            'gen_ai.response.model': response.model ?? this.config.model,
+            'gen_ai.usage.input_tokens': response.usage?.promptTokens ?? 0,
+            'gen_ai.usage.output_tokens': response.usage?.completionTokens ?? 0,
+            'gen_ai.usage.total_tokens': response.usage?.totalTokens ?? 0,
+          });
+          return response;
+        } catch (err) {
+          span.recordException(err as Error);
+          span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+          throw err;
+        } finally {
+          span.end();
+        }
+      }
+    );
+  }
+
+  private async chatImpl(
     messages: LLMMessage[],
     options?: ChatOptions
   ): Promise<LLMResponse> {
