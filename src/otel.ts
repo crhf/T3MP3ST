@@ -17,7 +17,7 @@
  * Any failure here is swallowed — telemetry must never break a mission.
  */
 import { NodeSDK } from '@opentelemetry/sdk-node';
-import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
 
@@ -36,7 +36,9 @@ if (telemetryRequested()) {
         [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME || 't3mp3st',
         [ATTR_SERVICE_VERSION]: process.env.npm_package_version || 'dev',
       }),
-      // OTLPTraceExporter appends /v1/traces to the base endpoint itself.
+      // Protobuf exporter (not the JSON `-http` one): OTLP/HTTP collectors
+      // such as VeriGrey's accept application/x-protobuf only. OTLPTraceExporter
+      // appends /v1/traces to the base endpoint itself.
       traceExporter: new OTLPTraceExporter({ url: `${endpoint.replace(/\/$/, '')}/v1/traces` }),
     });
     sdk.start();
