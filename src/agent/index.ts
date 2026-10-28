@@ -498,7 +498,8 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
     // Promise.all fan-out in the loop) each get their own span because this is
     // an async function and startActiveSpan scopes to its callback's context.
     return agentTracer.startActiveSpan(
-      'execute_tool',
+      // OTel GenAI convention names the span `execute_tool {gen_ai.tool.name}`.
+      `execute_tool ${toolCall.name}`,
       {
         attributes: {
           'gen_ai.operation.name': 'execute_tool',
@@ -519,7 +520,8 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
   ): Promise<AgentStep> {
     this.emit('agent:tool_call', { name: toolCall.name, args: toolCall.arguments, source });
     if (otelCaptureContent) {
-      span.setAttribute('t3mp3st.tool.arguments', otelClip(JSON.stringify(toolCall.arguments ?? {})));
+      // OTel GenAI convention: the tool's arguments as a serialized object.
+      span.setAttribute('gen_ai.tool.call.arguments', otelClip(JSON.stringify(toolCall.arguments ?? {})));
     }
 
     let toolResult: ToolResult;
@@ -563,17 +565,17 @@ export class AgentLoop extends EventEmitter<AgentEvents> {
 
     this.emit('agent:tool_result', { name: toolCall.name, result: toolResult, source });
 
-    // Record outcome on the span. Tool failures are returned as structured
-    // feedback (not thrown), so mark the span's status from toolResult.success
-    // and surface the failure category when present.
-    span.setAttribute('t3mp3st.tool.success', toolResult.success);
-    if (otelCaptureContent) {
-      span.setAttribute('t3mp3st.tool.result', otelClip(JSON.stringify(toolResult)));
-    }
-    if (!toolResult.success) {
-      let category = 'error';
-      try { category = JSON.parse(toolResult.error ?? '{}').category ?? 'error'; } catch { /* non-JSON error */ }
-      span.setAttribute('t3mp3st.tool.error_category', category);
+    // Record outcome on the span by the OTel GenAI convention. Tool failures
+    // are returned as structured feedback (not thrown): a success carries the
+    // result, a failure carries error.type and an Error status, never both.
+    if (toolResult.success) {
+      if (otelCaptureContent) {
+        span.setAttribute('gen_ai.tool.call.result', otelClip(JSON.stringify(toolResult)));
+      }
+    } else {
+      let category = '_OTHER';
+      try { category = JSON.parse(toolResult.error ?? '{}').category ?? '_OTHER'; } catch { /* non-JSON error */ }
+      span.setAttribute('error.type', category);
       span.setStatus({ code: SpanStatusCode.ERROR, message: category });
     }
     span.end();
